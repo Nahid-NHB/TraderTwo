@@ -87,7 +87,33 @@ public:
 
     [[nodiscard]] Order* head_order() const noexcept;
 
+    // ---- Match-time mutators ---------------------------------------------
+    // The matcher calls these while filling resting orders. They are kept
+    // public-on-purpose because the matcher is in the same translation unit
+    // logically; alternatively they could be private with a friend class.
+    //
+    // reduce_front(qty): fill the front-of-queue order by qty. If fully
+    // consumed, removes it from the level. Returns the new remaining qty
+    // of the front order (0 if it was removed), and writes the filled order
+    // pointer to `filled_out`.
+    //
+    // On partial fill, the residual order stays at the HEAD of the queue
+    // (it keeps time priority over later arrivals at the same price). This
+    // matches the conventional behavior of major equity exchanges.
+    Order* front() const noexcept { return head_order(); }
+    Quantity front_remaining() const noexcept;
+
+    // Reduce the front order's remaining by `qty`. If the front becomes
+    // empty, unlinks it. Returns the filled quantity (capped at front's
+    // remaining). Sets `consumed_out` to true if the front was removed.
+    Quantity reduce_front(Quantity qty, Order*& filled_out, bool& consumed_out) noexcept;
+
+    // Total quantity helpers (used by match-time accounting).
+    void   add_to_total(Quantity q) noexcept { total_quantity_ += q; }
+    void   sub_from_total(Quantity q) noexcept { total_quantity_ -= q; }
+
 private:
+    friend class OrderBook;
     Price price_{Price{0}};
     OrderListNode* head_{nullptr};   // oldest order at this level
     OrderListNode* tail_{nullptr};   // newest order at this level
@@ -119,6 +145,34 @@ public:
 
     // Cancel an existing order by ID. Returns true if found and cancelled.
     bool cancel(OrderId id);
+
+    // ---- Match-time hooks (Phase 2) ---------------------------------------
+    // The matcher drives a fill by calling fill() against a resting order.
+    // If the resting order is fully consumed it is unlinked from its level
+    // (and the level destroyed if empty). If partially filled, its remaining
+    // quantity is decremented and the level's totals are updated.
+    //
+    // Returns true if the order still lives in the book after the call.
+    bool fill(OrderId resting_id, Quantity qty) noexcept;
+
+    // Drop a resting order without filling it (e.g. cancel or reject during
+    // a match). Idempotent for unknown IDs.
+    void remove(OrderId id) noexcept;
+
+    // Direct accessors used by the matcher when walking the opposite side.
+    [[nodiscard]] Order* best_opposite_order(Side aggressor_side) const noexcept;
+    [[nodiscard]] Price   best_opposite_price(Side aggressor_side) const noexcept;
+
+    // Snapshot the top of book (price + front-of-queue qty). Avoids the
+    // matcher having to dereference two structures separately.
+    struct TopOfBook {
+        bool    valid{false};
+        Price   price{Price{0}};
+        Quantity quantity{Quantity{0}};
+        std::size_t order_count{0};
+    };
+    [[nodiscard]] TopOfBook top_bid() const noexcept;
+    [[nodiscard]] TopOfBook top_ask() const noexcept;
 
     // ---- Queries ----------------------------------------------------------
     [[nodiscard]] bool empty() const noexcept {

@@ -181,4 +181,116 @@ void OrderBook::depth(std::size_t levels,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Level: match-time helpers
+// ---------------------------------------------------------------------------
+Quantity Level::front_remaining() const noexcept {
+    Order* o = front();
+    return o ? o->remaining : Quantity{0};
+}
+
+Quantity Level::reduce_front(Quantity qty, Order*& filled_out, bool& consumed_out) noexcept {
+    Order* o = front();
+    filled_out = nullptr;
+    consumed_out = false;
+    if (!o || qty.qty <= 0) return Quantity{0};
+
+    Quantity fill_qty = qty;
+    if (fill_qty.qty > o->remaining.qty) fill_qty = o->remaining;
+
+    // Update level totals: subtract the fill from total, but keep the
+    // residual on the books.
+    total_quantity_ -= fill_qty;
+    o->remaining    -= fill_qty;
+
+    if (o->remaining.qty == 0) {
+        // Fully consumed. Unlink from the list and update counts.
+        OrderListNode* node = &o->list_node;
+        if (node->prev) {
+            node->prev->next = node->next;
+        } else {
+            head_ = node->next;
+        }
+        if (node->next) {
+            node->next->prev = node->prev;
+        } else {
+            tail_ = node->prev;
+        }
+        node->prev = nullptr;
+        node->next = nullptr;
+        --order_count_;
+        consumed_out = true;
+        o->status = OrderStatus::Filled;
+    } else {
+        // Partial fill: residual stays at HEAD (preserves time priority).
+        if (o->status == OrderStatus::New) {
+            o->status = OrderStatus::PartiallyFilled;
+        }
+    }
+    filled_out = o;
+    return fill_qty;
+}
+
+// ---------------------------------------------------------------------------
+// OrderBook: match-time helpers
+// ---------------------------------------------------------------------------
+// Apply a fill to a resting order by ID. Decrements remaining, unlinks if
+// fully consumed, frees the level if it becomes empty. Returns true if the
+// order is still in the book after the call (i.e. partial fill).
+bool OrderBook::fill(OrderId id, Quantity qty) noexcept {
+    auto it = id_index_.find(id);
+    if (it == id_index_.end()) return false;
+    Order& o = *(it->second);
+
+    bool is_bid = o.is_buy();
+    Level* lvl = nullptr;
+    if (is_bid) {
+        auto lit = bids_.find(o.price);
+        assert(lit != bids_.end());
+        lvl = lit->second;
+    } else {
+        auto lit = asks_.find(o.price);
+        assert(lit != asks_.end());
+        lvl = lit->second;
+    }
+
+    Order* filled = nullptr;
+    bool consumed = false;
+    // reduce_front caps qty at the front's remaining, so even if the
+    // caller passes too much we never over-fill.
+    lvl->reduce_front(qty, filled, consumed);
+
+    if (consumed) {
+        id_index_.erase(it);
+        if (lvl->order_count() == 0) {
+            destroy_level(o.price, is_bid);
+        }
+    }
+    return !consumed;
+}
+
+void OrderBook::remove(OrderId id) noexcept {
+    cancel(id);
+}
+
+Order* OrderBook::best_opposite_order(Side aggressor_side) const noexcept {
+    return aggressor_side == Side::Buy ? best_ask_order() : best_bid_order();
+}
+
+Price OrderBook::best_opposite_price(Side aggressor_side) const noexcept {
+    return aggressor_side == Side::Buy ? best_ask() : best_bid();
+}
+
+OrderBook::TopOfBook OrderBook::top_bid() const noexcept {
+    if (bids_.empty()) return TopOfBook{};
+    const Level* lvl = bids_.begin()->second;
+    return TopOfBook{true, bids_.begin()->first, lvl->total_quantity(), lvl->order_count()};
+}
+
+OrderBook::TopOfBook OrderBook::top_ask() const noexcept {
+    if (asks_.empty()) return TopOfBook{};
+    const Level* lvl = asks_.begin()->second;
+    return TopOfBook{true, asks_.begin()->first, lvl->total_quantity(), lvl->order_count()};
+}
+
 }  // namespace tt
