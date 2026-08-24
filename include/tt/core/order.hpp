@@ -52,7 +52,7 @@ inline bool operator!=(Side a, Side b) noexcept { return !(a == b); }
 
 // Flip a side. Encapsulated as a function so callers don't sprinkle casts.
 constexpr Side opposite(Side s) noexcept {
-    return s == Side::Buy ? Side::Sell : Side::Buy;
+    return static_cast<Side>(static_cast<uint8_t>(s) ^ 1u);
 }
 
 #pragma pack(push, 1)

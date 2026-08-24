@@ -5,6 +5,7 @@
 #include "tt/orderbook/order_book.hpp"
 
 #include <cassert>
+#include <type_traits>
 #include <utility>
 
 namespace tt {
@@ -17,17 +18,22 @@ namespace tt {
 
 namespace {
 inline Order* order_from_node(OrderListNode* node) noexcept {
-    // Compute offset of list_node within Order at compile time via a
-    // standard-layout trick: a temporary instance is fine since Order is
-    // standard layout (only POD-like fields).
-    static_assert(std::is_standard_layout<Order>::value,
-                  "Order must be standard-layout for offset arithmetic");
-    static constexpr std::ptrdiff_t kOffset =
-        reinterpret_cast<char*>(&(reinterpret_cast<Order*>(0x1000)->list_node)) -
-        reinterpret_cast<char*>(reinterpret_cast<Order*>(0x1000));
-    return reinterpret_cast<Order*>(reinterpret_cast<char*>(node) - kOffset);
+    // Order is a packed standard-layout struct, so we can compute the offset
+    // of list_node with offsetof. We use a local Order instance rather than
+    // dereferencing a literal pointer (which would be UB).
+    Order sample{};
+    std::ptrdiff_t offset = reinterpret_cast<char*>(&sample.list_node) -
+                            reinterpret_cast<char*>(&sample);
+    return reinterpret_cast<Order*>(reinterpret_cast<char*>(node) - offset);
 }
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Level method bodies that need the offset helper.
+// ---------------------------------------------------------------------------
+Order* Level::head_order() const noexcept {
+    return head_ ? order_from_node(head_) : nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // OrderBook
@@ -37,21 +43,30 @@ OrderBook::OrderBook(InstrumentId instrument) noexcept : instrument_(instrument)
 OrderBook::~OrderBook() = default;
 
 Level* OrderBook::get_or_create_level(Price price, bool is_bid) {
-    auto& ladder = is_bid ? bids_ : asks_;
-    auto it = ladder.find(price);
-    if (it != ladder.end()) {
-        return it->second;
+    if (is_bid) {
+        auto it = bids_.find(price);
+        if (it != bids_.end()) return it->second;
+        auto level = std::make_unique<Level>(price);
+        Level* raw = level.get();
+        level_storage_.emplace(price, std::move(level));
+        bids_.emplace(price, raw);
+        return raw;
     }
+    auto it = asks_.find(price);
+    if (it != asks_.end()) return it->second;
     auto level = std::make_unique<Level>(price);
     Level* raw = level.get();
     level_storage_.emplace(price, std::move(level));
-    ladder.emplace(price, raw);
+    asks_.emplace(price, raw);
     return raw;
 }
 
 void OrderBook::destroy_level(Price price, bool is_bid) {
-    auto& ladder = is_bid ? bids_ : asks_;
-    ladder.erase(price);
+    if (is_bid) {
+        bids_.erase(price);
+    } else {
+        asks_.erase(price);
+    }
     level_storage_.erase(price);
 }
 
@@ -87,21 +102,29 @@ bool OrderBook::cancel(OrderId id) {
     }
 
     bool is_bid = o.is_buy();
-    auto ladder_it = (is_bid ? bids_ : asks_).find(o.price);
-    assert(ladder_it != (is_bid ? bids_ : asks_).end());
-
-    Level* lvl = ladder_it->second;
-    lvl->remove(o);
-
-    // If the level is now empty, free it.
-    if (lvl->order_count() == 0) {
-        destroy_level(o.price, is_bid);
+    if (is_bid) {
+        auto ladder_it = bids_.find(o.price);
+        assert(ladder_it != bids_.end());
+        Level* lvl = ladder_it->second;
+        lvl->remove(o);
+        if (lvl->order_count() == 0) {
+            destroy_level(o.price, true);
+        }
+    } else {
+        auto ladder_it = asks_.find(o.price);
+        assert(ladder_it != asks_.end());
+        Level* lvl = ladder_it->second;
+        lvl->remove(o);
+        if (lvl->order_count() == 0) {
+            destroy_level(o.price, false);
+        }
     }
 
     o.status = OrderStatus::Cancelled;
     id_index_.erase(it);
     return true;
 }
+
 
 Price OrderBook::best_bid() const noexcept {
     if (bids_.empty()) return Price{kInvalidPrice};

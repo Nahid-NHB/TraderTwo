@@ -85,28 +85,9 @@ public:
         total_quantity_ -= o.remaining;
     }
 
-    [[nodiscard]] Order* head_order() const noexcept {
-        return head_ ? container_of(head_, &Order::list_node) : nullptr;
-    }
+    [[nodiscard]] Order* head_order() const noexcept;
 
 private:
-    // Reinterpret an OrderListNode* back to its owning Order*.
-    static Order* container_of(OrderListNode* node, OrderListNode Order::* field) noexcept {
-        // Compute offset of field within Order at compile time.
-        // Using std::launder-equivalent pointer arithmetic: we know the node
-        // is embedded at a fixed offset, so we cast through a uintptr_t.
-        // Note: rely on offsetof in C++20.
-        // (offsetof on a non-standard-layout type is UB pre-C++23; in
-        // practice all our compilers accept it on trivially-relocatable PODs.)
-        // Fall back to a sentinel nullptr if the offset is wrong.
-        static_assert(sizeof(OrderListNode Order::*) > 0, "field pointer must be non-null");
-        // Compute offset manually for portability.
-        Order temp{};
-        std::ptrdiff_t offset =
-            reinterpret_cast<char*>(&(temp.*field)) - reinterpret_cast<char*>(&temp);
-        return reinterpret_cast<Order*>(reinterpret_cast<char*>(node) - offset);
-    }
-
     Price price_{Price{0}};
     OrderListNode* head_{nullptr};   // oldest order at this level
     OrderListNode* tail_{nullptr};   // newest order at this level
