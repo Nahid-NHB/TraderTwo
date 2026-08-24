@@ -20,6 +20,7 @@ add_library(tt_core
     src/common/types.cpp
     src/core/order.cpp
     src/orderbook/order_book.cpp
+    src/matching/matching_engine.cpp
 )
 
 target_include_directories(tt_core
@@ -71,6 +72,7 @@ if(TT_BUILD_TESTS)
     add_executable(tt_tests
         tests/test_order_book.cpp
         tests/test_common.cpp
+        tests/test_matching_engine.cpp
     )
     target_link_libraries(tt_tests PRIVATE tt_core GTest::gtest GTest::gtest_main)
 

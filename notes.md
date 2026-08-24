@@ -49,8 +49,8 @@ TraderTwo/
 
 | Phase | Goal | Status |
 |------|------|--------|
-| **1** | Core domain types + price-time-priority order book | **In progress** |
-| 2 | Matching engine (limit + market, partial fills) | pending |
+| 1 | Core domain types + price-time-priority order book | **Done (commit `c02136b`)** |
+| **2** | Matching engine (limit + market, partial fills) | **In progress** |
 | 3 | Cancel + modify (with priority reset on price change) | pending |
 | 4 | Multiple instruments registry | pending |
 | 5 | Event system + market-data publisher | pending |
@@ -107,6 +107,61 @@ TraderTwo/
 ### What Phase 1 does NOT include
 
 No matching yet (Phase 2). No networking, persistence, concurrency. The book only holds and exposes orders.
+
+---
+
+## Phase 2 — Matching Engine
+
+### What was built
+
+- `OrderBook` extended with match-time helpers:
+  - `Level::reduce_front(qty)` — fills the front-of-queue order, unlinks if fully consumed, **keeps the residual at HEAD on partial fill** (preserves time priority — matches NYSE/CME convention).
+  - `OrderBook::fill(id, qty)` — drives a fill by ID; returns whether the order is still alive.
+  - `OrderBook::best_opposite_{order,price}(side)` — fast opposite-side access.
+  - `OrderBook::top_bid()/top_ask()` — snapshot.
+- `MatchingEngine` (`include/tt/matching/matching_engine.hpp`):
+  - One `OrderBook` per `InstrumentId`; registry via `register_instrument`.
+  - `submit(order, sink)` validates, assigns sequence, runs the match loop, rests GTC residuals, drops IOC/market remainders.
+  - `submit_limit(...)` helper for tests/benches.
+  - `cancel(instrument, id)` proxies to the book.
+  - `TradeSink` virtual interface with `CollectingSink` reference impl for tests.
+- Tests: 20 gtest cases covering exact/partial/multi-level fills, price priority, FIFO, market sweep, IOC, validation rejects, sequence monotonicity, multi-instrument isolation, passive-price execution.
+
+### Matching algorithm (price-time priority)
+
+```
+WHILE taker.remaining > 0:
+    best_opposite = opposite_book.best_price()
+    IF best_opposite invalid OR (limit AND !crosses): BREAK
+    resting = opposite_book.best_order()
+    fill_qty = min(taker.remaining, resting.remaining)
+    opposite_book.fill(resting.id, fill_qty)
+    taker.remaining -= fill_qty
+    emit Trade(taker.id, resting.id, fill_qty, exec_price = best_opposite)
+
+IF taker.remaining > 0:
+    IF market OR IOC: drop remainder
+    ELSE (limit GTC): rest into book
+```
+
+Trade price is always the **passive (resting) price** — no price improvement from aggressor side. Sequence numbers are authoritative for FIFO tie-breaks.
+
+### Complexity
+
+| Operation | Time |
+|---|---|
+| Match (M fills across L levels) | O(M log L + M) |
+| Insert resting order | O(log L) |
+| Cancel by ID | O(1) avg |
+| Best bid/ask | O(log L) |
+| Multi-instrument dispatch | O(1) via hashmap |
+
+### Design decisions documented
+
+1. **Residual stays at HEAD on partial fill** — keeps time priority for the order that was there first; matches conventional equity exchanges.
+2. **Trade price = passive price** — never the aggressor's price; protects resting orders from price-walking.
+3. **Sequence numbers consumed by both orders and trades** — keeps a single global monotonic source of truth (useful for replay and tie-breaks).
+4. **`TradeSink` is virtual, not std::function** — avoids a virtual call per trade? Actually it IS virtual; we pay one indirection per trade because the consumer (network thread, persistence) wants polymorphism. The hot path could switch to a function pointer later if profiling demands it.
 
 ---
 
