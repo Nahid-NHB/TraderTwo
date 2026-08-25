@@ -146,6 +146,25 @@ public:
     // Cancel an existing order by ID. Returns true if found and cancelled.
     bool cancel(OrderId id);
 
+    // Modify an existing order. Behaviour depends on what changed:
+    //  - Quantity decrease only: keep priority, decrease remaining.
+    //  - Quantity increase or any price change: cancel + reinsert at the
+    //    back of the new level. Time priority is reset.
+    // Returns true on success. Idempotent no-op if qty unchanged and price
+    // unchanged (returns false if the order doesn't exist).
+    enum class ModifyResult : uint8_t {
+        NotFound      = 0,
+        Rejected      = 1,
+        Modified      = 2,   // quantity reduced in-place
+        Replaced      = 3,   // priority reset (qty up or price changed)
+    };
+    ModifyResult modify(OrderId id, Quantity new_qty, Price new_price) noexcept;
+
+    // Reduce the visible quantity of a resting order without changing its
+    // time priority. The order remains in place; remaining quantity is
+    // decremented. Used for self-trade prevention / iceberg-style reductions.
+    bool reduce(OrderId id, Quantity new_qty) noexcept;
+
     // ---- Match-time hooks (Phase 2) ---------------------------------------
     // The matcher drives a fill by calling fill() against a resting order.
     // If the resting order is fully consumed it is unlinked from its level

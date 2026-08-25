@@ -71,18 +71,18 @@ void OrderBook::destroy_level(Price price, bool is_bid) {
 }
 
 bool OrderBook::insert(std::unique_ptr<Order> order) {
-    if (!order) return false;
-    if (order->id == kInvalidOrderId) return false;
+    if (!order) [[unlikely]] return false;
+    if (order->id == kInvalidOrderId) [[unlikely]] return false;
     if (!order->is_limit()) {
         // Phase 1 only handles resting limit orders. Market orders go through
         // the matcher in Phase 2. We refuse here so the book stays pure.
         return false;
     }
-    if (!order->price.is_valid()) return false;
-    if (!order->remaining.is_valid()) return false;
+    if (!order->price.is_valid()) [[unlikely]] return false;
+    if (!order->remaining.is_valid()) [[unlikely]] return false;
 
     // Reject duplicates so we never have two live orders with the same ID.
-    if (id_index_.find(order->id) != id_index_.end()) return false;
+    if (id_index_.find(order->id) != id_index_.end()) [[unlikely]] return false;
 
     bool is_bid = order->is_buy();
     Level* level = get_or_create_level(order->price, is_bid);
@@ -95,7 +95,7 @@ bool OrderBook::insert(std::unique_ptr<Order> order) {
 
 bool OrderBook::cancel(OrderId id) {
     auto it = id_index_.find(id);
-    if (it == id_index_.end()) return false;
+    if (it == id_index_.end()) [[unlikely]] return false;
     Order& o = *(it->second);
     if (o.status == OrderStatus::Filled || o.status == OrderStatus::Cancelled) {
         return false;
@@ -271,6 +271,94 @@ bool OrderBook::fill(OrderId id, Quantity qty) noexcept {
 
 void OrderBook::remove(OrderId id) noexcept {
     cancel(id);
+}
+
+bool OrderBook::reduce(OrderId id, Quantity new_qty) noexcept {
+    auto it = id_index_.find(id);
+    if (it == id_index_.end()) return false;
+    Order& o = *(it->second);
+    if (o.status == OrderStatus::Filled || o.status == OrderStatus::Cancelled) {
+        return false;
+    }
+    if (new_qty.qty <= 0 || new_qty.qty >= o.remaining.qty) return false;
+
+    bool is_bid = o.is_buy();
+    Quantity diff{Quantity{o.remaining.qty - new_qty.qty}};
+    if (is_bid) {
+        auto lit = bids_.find(o.price);
+        assert(lit != bids_.end());
+        lit->second->sub_from_total(diff);
+    } else {
+        auto lit = asks_.find(o.price);
+        assert(lit != asks_.end());
+        lit->second->sub_from_total(diff);
+    }
+    o.remaining = new_qty;
+    if (o.status == OrderStatus::New) o.status = OrderStatus::PartiallyFilled;
+    return true;
+}
+
+OrderBook::ModifyResult OrderBook::modify(OrderId id, Quantity new_qty,
+                                          Price new_price) noexcept {
+    auto it = id_index_.find(id);
+    if (it == id_index_.end()) return ModifyResult::NotFound;
+    Order& o = *(it->second);
+    if (o.status == OrderStatus::Filled || o.status == OrderStatus::Cancelled) {
+        return ModifyResult::NotFound;
+    }
+    if (o.is_market()) return ModifyResult::Rejected;
+    if (!new_qty.is_valid()) return ModifyResult::Rejected;
+    if (!new_price.is_valid()) return ModifyResult::Rejected;
+
+    // Same price and qty: no-op, success.
+    if (new_price == o.price && new_qty == o.remaining) {
+        return ModifyResult::Modified;
+    }
+
+    // Same price, qty decreasing: priority preserved.
+    if (new_price == o.price && new_qty.qty < o.remaining.qty) {
+        bool is_bid = o.is_buy();
+        Quantity diff{Quantity{o.remaining.qty - new_qty.qty}};
+        if (is_bid) {
+            auto lit = bids_.find(o.price);
+            assert(lit != bids_.end());
+            lit->second->sub_from_total(diff);
+        } else {
+            auto lit = asks_.find(o.price);
+            assert(lit != asks_.end());
+            lit->second->sub_from_total(diff);
+        }
+        o.remaining = new_qty;
+        o.quantity  = Quantity{o.quantity.qty - diff.qty};
+        if (o.status == OrderStatus::New) o.status = OrderStatus::PartiallyFilled;
+        return ModifyResult::Modified;
+    }
+
+    // Price change OR quantity increase: replace (priority reset).
+    bool is_bid = o.is_buy();
+    Price old_price = o.price;
+    if (is_bid) {
+        auto lit = bids_.find(old_price);
+        assert(lit != bids_.end());
+        Level* lvl = lit->second;
+        lvl->remove(o);
+        if (lvl->order_count() == 0) destroy_level(old_price, true);
+    } else {
+        auto lit = asks_.find(old_price);
+        assert(lit != asks_.end());
+        Level* lvl = lit->second;
+        lvl->remove(o);
+        if (lvl->order_count() == 0) destroy_level(old_price, false);
+    }
+
+    o.price    = new_price;
+    o.quantity = new_qty;
+    o.remaining= new_qty;
+    o.status   = OrderStatus::New;
+
+    Level* new_level = get_or_create_level(new_price, is_bid);
+    new_level->append(o);
+    return ModifyResult::Replaced;
 }
 
 Order* OrderBook::best_opposite_order(Side aggressor_side) const noexcept {
