@@ -27,6 +27,7 @@ add_library(tt_core
     src/concurrency/worker_pool.cpp
     src/networking/protocol.cpp
     src/networking/gateway.cpp
+    src/networking/ws_server.cpp
     src/observability/metrics.cpp
     src/observability/structured_log.cpp
 )
@@ -56,6 +57,9 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(tt_core PUBLIC Threads::Threads)
+
+find_package(OpenSSL REQUIRED)
+target_link_libraries(tt_core PUBLIC OpenSSL::Crypto)
 
 # ---------------------------------------------------------------------------
 # Demo executable
@@ -96,6 +100,7 @@ if(TT_BUILD_TESTS)
         tests/test_networking.cpp
         tests/test_observability.cpp
         tests/test_stress.cpp
+        tests/test_websocket.cpp
     )
     target_link_libraries(tt_tests PRIVATE tt_core GTest::gtest GTest::gtest_main)
 
