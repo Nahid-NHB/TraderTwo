@@ -1,8 +1,27 @@
 # TraderTwo Dashboard
 
-A small SvelteKit SPA that connects to the WebSocket market-data endpoint
-exposed by `tt_simulator --ws-port P` and renders live trades + top-of-book
-updates in a clean dark UI.
+A TradingView-styled SvelteKit SPA that connects to the WebSocket
+market-data endpoint exposed by `tt_simulator --ws-port P` and visualises
+live trades + top-of-book in a familiar broker-terminal layout.
+
+## Layout
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ TraderTwo [LIVE]  Inst: ▾   ws://127.0.0.1:9001  ● open      │
+│ Last | Spread | Trades | TOB updates                          │
+├──────────────────────────────────────────┬────────────────────┤
+│                                          │                    │
+│   Candlestick chart (TradingView)        │   Depth chart      │
+│   + volume histogram                     │   (bid/ask area)   │
+│                                          │                    │
+├──────────────────────────────────────────┴────────────────────┤
+│  Best bid/ask ladder        │  Time & sales (filtered)        │
+└───────────────────────────────────────────────────────────────┘
+```
+
+Charts are powered by [TradingView Lightweight Charts™](https://tradingview.github.io/lightweight-charts/),
+the same open-source rendering library TradingView ships for embeds.
 
 ## Run it
 
@@ -18,7 +37,22 @@ npm run dev
 ```
 
 The default WS port is `9001`. Pass `?port=N` in the URL to point at a
-different one.
+different one. The instrument dropdown is populated automatically from
+whichever instruments the engine emits events for.
+
+## Features
+
+- **Live candlestick chart** — 1s / 5s / 15s candles synthesised on the fly
+  from the trade feed, with a volume histogram overlay.
+- **Depth chart** — bid/ask cumulative-quantity staircase that updates
+  every 100ms, with a centre line at the mid-price.
+- **Order-book ladder** — best bid/ask with bid and ask quantities,
+  colour-coded in the TradingView teal/red palette.
+- **Time & sales** — tape of recent trades for the selected instrument,
+  with green/red flash highlighting for up/down ticks relative to the
+  previous trade.
+- **Header metrics** — last price, spread, total trade count, TOB-update
+  count, and connection status.
 
 ## Build static output
 

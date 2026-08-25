@@ -113,7 +113,7 @@ npm run dev
 # open http://127.0.0.1:5173/?port=9001
 ```
 
-The C++ side exposes a minimal RFC 6455 WebSocket server (`src/networking/ws_server.cpp`) that broadcasts JSON frames for every trade and top-of-book update. The dashboard (under `dashboard/`) is a SvelteKit SPA that connects, parses the frames, and renders the live book + a running tape of trades.
+The C++ side exposes a minimal RFC 6455 WebSocket server (`src/networking/ws_server.cpp`) that broadcasts JSON frames for every trade and top-of-book update. The dashboard (under `dashboard/`) is a SvelteKit SPA styled like TradingView: candlestick chart (powered by TradingView Lightweight Charts™), depth visualisation, order-book ladder, and time-and-sales tape.
 
 Message format:
 
