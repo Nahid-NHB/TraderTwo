@@ -10,16 +10,18 @@
   let wsPort = 9001;
   let selectedInstrument = 1;
   let candleSeconds = 1;
+  let useMock = false;
 
   if (typeof window !== 'undefined') {
     const q = new URLSearchParams(window.location.search);
     const p = parseInt(q.get('port') ?? '', 10);
     if (Number.isFinite(p) && p > 0 && p < 65536) wsPort = p;
+    useMock = q.get('mock') === '1' || q.get('mock') === 'true';
   }
   const wsUrl = `ws://${typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1'}:${wsPort}`;
 
   // ----- Streams -----
-  const md = createMarketDataStore(wsUrl);
+  const md = createMarketDataStore({ url: wsUrl, mock: useMock });
   const candles = createCandleAggregator(candleSeconds * 1000);
   const depth = createDepthStore();
 
@@ -304,7 +306,7 @@
 <main>
   <header>
     <div class="brand">
-      <h1>TraderTwo <span class="tag">live</span></h1>
+      <h1>TraderTwo <span class="tag">{useMock ? 'mock' : 'live'}</span></h1>
       <div class="sub">
         <select bind:value={selectedInstrument}>
           {#each $instruments as i}
@@ -312,8 +314,8 @@
           {/each}
         </select>
         <span class="status-text">
-          <span class="dot {md.status}"></span>
-          {wsUrl} · {md.status}
+          <span class="dot {useMock ? 'open' : md.status}"></span>
+          {useMock ? 'mock generator · ~14 ticks/s' : `${wsUrl} · ${md.status}`}
         </span>
       </div>
     </div>
@@ -419,7 +421,13 @@
   </section>
 
   <footer>
-    <p>Engine: <code>./build/tt_simulator --random 50000 --instruments 4 --ws-port {wsPort}</code></p>
+    {#if useMock}
+      <p>Running with synthetic mock data. Switch to the live engine with
+        <a href="?port={wsPort}">?port={wsPort}</a>.</p>
+    {:else}
+      <p>Engine: <code>./build/tt_simulator --random 50000 --instruments 4 --ws-port {wsPort}</code></p>
+      <p>No engine? Try <a href="?mock=1">?mock=1</a> for a synthetic feed.</p>
+    {/if}
     <p>This dashboard uses <a href="https://tradingview.github.io/lightweight-charts/">TradingView Lightweight Charts™</a> for the candlestick rendering.</p>
   </footer>
 </main>
