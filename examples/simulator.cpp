@@ -21,12 +21,16 @@
 //   --port P          If set, also start a TCP gateway on port P (in addition
 //                     to running the simulation synchronously on the main
 //                     thread first).
+//   --ws-port P       If set, also start a WebSocket market-data server on
+//                     port P after the sim completes. Use this with the
+//                     dashboard SPA under dashboard/.
 //   --quiet           Don't print per-trade / per-order lines; only summary.
 //
 // Examples:
 //   ./tt_simulator --script orders.txt --log run.bin
 //   ./tt_simulator --random 100000 --instruments 8 --log run.bin
 //   ./tt_simulator --random 1000 --port 9000
+//   ./tt_simulator --random 100000 --instruments 4 --port 9000 --ws-port 9001
 
 #include "tt/common/instrument.hpp"
 #include "tt/common/types.hpp"
@@ -35,6 +39,7 @@
 #include "tt/matching/matching_engine.hpp"
 #include "tt/networking/gateway.hpp"
 #include "tt/networking/protocol.hpp"
+#include "tt/networking/ws_server.hpp"
 #include "tt/persistence/event_log.hpp"
 
 #include <atomic>
@@ -233,6 +238,7 @@ void print_usage(const char* prog) {
         "  --seed S         PRNG seed (random mode). Default: 42.\n"
         "  --log FILE       Persist events to this event log.\n"
         "  --port P         Also start TCP gateway on port P after sim completes.\n"
+        "  --ws-port P      Also start WebSocket market-data server on port P.\n"
         "  --quiet          Don't print per-event lines; only summary.\n",
         prog);
 }
@@ -245,6 +251,7 @@ int main(int argc, char** argv) {
     bool        random_mode = false;
     bool        quiet       = false;
     int         port        = 0;
+    int         ws_port     = 0;
     RandomConfig cfg;
 
     for (int i = 1; i < argc; ++i) {
@@ -262,6 +269,7 @@ int main(int argc, char** argv) {
         else if (a == "--seed")        cfg.seed = std::stoull(need("--seed"));
         else if (a == "--log")         log_path  = need("--log");
         else if (a == "--port")        port      = std::atoi(need("--port"));
+        else if (a == "--ws-port")     ws_port   = std::atoi(need("--ws-port"));
         else if (a == "--quiet")       quiet     = true;
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown flag: %s\n", a.c_str()); print_usage(argv[0]); return 2; }
@@ -323,14 +331,27 @@ int main(int argc, char** argv) {
         std::printf("event log    = %s\n", log_path.c_str());
     }
 
-    if (port > 0) {
+    if (port > 0 || ws_port > 0) {
         MarketDataPublisher pub(engine);
-        Gateway gw(engine, pub, static_cast<std::uint16_t>(port));
-        if (!gw.start()) {
-            std::fprintf(stderr, "failed to start gateway on port %d\n", port);
-            return 1;
+        std::unique_ptr<Gateway>   gw;
+        std::unique_ptr<WsServer>  ws;
+        if (port > 0) {
+            gw = std::make_unique<Gateway>(engine, pub, static_cast<std::uint16_t>(port));
+            if (!gw->start()) {
+                std::fprintf(stderr, "failed to start gateway on port %d\n", port);
+                return 1;
+            }
+            std::printf("gateway listening on 127.0.0.1:%d\n", port);
         }
-        std::printf("gateway listening on 127.0.0.1:%d (Ctrl-C to quit)\n", port);
+        if (ws_port > 0) {
+            ws = std::make_unique<WsServer>(pub, static_cast<std::uint16_t>(ws_port));
+            if (!ws->start()) {
+                std::fprintf(stderr, "failed to start ws server on port %d\n", ws_port);
+                if (gw) gw->stop();
+                return 1;
+            }
+            std::printf("websocket listening on 127.0.0.1:%d\n", ws_port);
+        }
 
         // Wait for Ctrl-C.
         std::signal(SIGINT,  on_signal);
@@ -338,8 +359,8 @@ int main(int argc, char** argv) {
         while (!g_done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        gw.stop();
-        std::printf("gateway stopped\n");
+        if (ws) { ws->stop(); std::printf("websocket stopped\n"); }
+        if (gw) { gw->stop(); std::printf("gateway stopped\n"); }
     }
     return 0;
 }
