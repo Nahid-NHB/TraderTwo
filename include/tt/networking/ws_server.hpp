@@ -56,6 +56,11 @@ private:
     std::atomic<bool> open_{true};
 };
 
+// Internal: shared handle to a peer. WsServer holds the canonical reference
+// in its map; serve_peer and broadcast snapshots carry a copy so the peer
+// stays alive even if the map entry is erased concurrently.
+using WsPeerPtr = std::shared_ptr<WsPeer>;
+
 // Per-peer callback bundle. Wired up by the application.
 struct WsPeerCallbacks {
     std::function<void(WsPeer&, const std::string& text)> on_text;
@@ -91,7 +96,7 @@ public:
 
 private:
     void accept_loop();
-    void serve_peer(uint64_t id, int fd);
+    void serve_peer(uint64_t id, int fd, WsPeerPtr peer);
     void on_publisher_event(const Event& e);
     void on_publisher_tob(InstrumentId id);
 
@@ -102,7 +107,7 @@ private:
     std::vector<std::thread>      threads_;
     std::unordered_set<uint64_t>  peer_ids_;
     std::mutex                    peer_ids_mtx_;
-    std::unordered_map<uint64_t, std::unique_ptr<WsPeer>> peers_;
+    std::unordered_map<uint64_t, WsPeerPtr> peers_;
     std::mutex                    peers_mtx_;
     WsPeerCallbacks cbs_;
 

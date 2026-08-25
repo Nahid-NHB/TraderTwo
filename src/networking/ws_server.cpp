@@ -235,20 +235,33 @@ void WsServer::stop() {
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
-    // Drop every peer.
+    // Tell every peer to shut down so blocked reads/writes unblock. Do NOT
+    // destroy the WsPeer objects yet — serve_peer threads still hold
+    // shared_ptrs to them.
+    std::vector<WsPeerPtr> snapshot;
     {
         std::lock_guard<std::mutex> lk(peers_mtx_);
-        for (auto& [id, peer] : peers_) peer->close(1001);
+        snapshot.reserve(peers_.size());
+        for (auto& [id, peer] : peers_) {
+            peer->close(1001);
+            snapshot.push_back(peer);
+        }
+    }
+    // Join serve_peer threads; each one erases itself from peers_ on exit.
+    for (auto& t : threads_) {
+        if (t.joinable()) t.join();
+    }
+    threads_.clear();
+    // Snapshots keep the WsPeer objects alive until we drop them here.
+    snapshot.clear();
+    {
+        std::lock_guard<std::mutex> lk(peers_mtx_);
         peers_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(peer_ids_mtx_);
         peer_ids_.clear();
     }
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
-    }
-    threads_.clear();
     pub_.unsubscribe(listener_.get());
 }
 
@@ -267,57 +280,53 @@ void WsServer::accept_loop() {
             id = static_cast<uint64_t>(peer_ids_.size()) + 1;
             peer_ids_.insert(id);
         }
-        auto peer = std::make_unique<WsPeer>(cfd, id);
+        WsPeerPtr peer = std::make_shared<WsPeer>(cfd, id);
         {
             std::lock_guard<std::mutex> lk(peers_mtx_);
-            peers_.emplace(id, std::move(peer));
+            peers_.emplace(id, peer);
         }
-        threads_.emplace_back([this, id, cfd]{ serve_peer(id, cfd); });
+        threads_.emplace_back([this, id, cfd, peer]{ serve_peer(id, cfd, peer); });
     }
 }
 
-void WsServer::serve_peer(uint64_t id, int fd) {
+void WsServer::serve_peer(uint64_t id, int fd, WsPeerPtr peer) {
+    // RAII guard: ensure the peer is removed from the map exactly once on
+    // every exit path, regardless of where we bail out. The shared_ptr
+    // captured by the lambda (or held in `peer`) keeps the WsPeer alive
+    // even if a concurrent broadcast is iterating over a snapshot.
+    bool erased = false;
+    auto cleanup = [&]() {
+        if (erased) return;
+        erased = true;
+        if (peer) peer->close_internal();
+        std::lock_guard<std::mutex> lk(peers_mtx_);
+        peers_.erase(id);
+        std::lock_guard<std::mutex> lk2(peer_ids_mtx_);
+        peer_ids_.erase(id);
+    };
+
     // 1. Read HTTP upgrade request.
     std::string req;
     char        buf[1024];
     while (req.find("\r\n\r\n") == std::string::npos) {
         ssize_t n = read_some(fd, buf, sizeof(buf));
-        if (n <= 0) {
-            ::close(fd);
-            std::lock_guard<std::mutex> lk(peers_mtx_);
-            peers_.erase(id);
-            return;
-        }
+        if (n <= 0) { cleanup(); return; }
         req.append(buf, static_cast<std::size_t>(n));
-        if (req.size() > 16 * 1024) {
-            ::close(fd);
-            std::lock_guard<std::mutex> lk(peers_mtx_);
-            peers_.erase(id);
-            return;
-        }
+        if (req.size() > 16 * 1024) { cleanup(); return; }
     }
 
     std::string method, path, version;
     if (!parse_request_line(req, method, path, version)) {
-        ::close(fd);
-        std::lock_guard<std::mutex> lk(peers_mtx_);
-        peers_.erase(id);
-        return;
+        cleanup(); return;
     }
     if (!ieq(method, "GET")) {
         send_all(fd, "HTTP/1.1 405 Method Not Allowed\r\n\r\n");
-        ::close(fd);
-        std::lock_guard<std::mutex> lk(peers_mtx_);
-        peers_.erase(id);
-        return;
+        cleanup(); return;
     }
     auto key = find_header(req, "Sec-WebSocket-Key");
     if (key.empty()) {
         send_all(fd, "HTTP/1.1 400 Bad Request\r\n\r\n");
-        ::close(fd);
-        std::lock_guard<std::mutex> lk(peers_mtx_);
-        peers_.erase(id);
-        return;
+        cleanup(); return;
     }
     std::string accept = sha1_b64(std::string(key) + std::string(kWsMagic));
 
@@ -327,22 +336,9 @@ void WsServer::serve_peer(uint64_t id, int fd) {
     resp += "Connection: Upgrade\r\n";
     resp += "Sec-WebSocket-Accept: " + accept + "\r\n";
     resp += "\r\n";
-    if (!send_all(fd, resp)) {
-        ::close(fd);
-        std::lock_guard<std::mutex> lk(peers_mtx_);
-        peers_.erase(id);
-        return;
-    }
+    if (!send_all(fd, resp)) { cleanup(); return; }
 
     // 2. Frame loop. Client→server frames are masked; we strip the mask.
-    WsPeer* peer = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(peers_mtx_);
-        auto it = peers_.find(id);
-        if (it != peers_.end()) peer = it->second.get();
-    }
-    if (!peer) return;
-
     std::string frame;
     while (running_.load(std::memory_order_acquire) && peer->open()) {
         ssize_t n = read_some(fd, buf, sizeof(buf));
@@ -399,22 +395,21 @@ void WsServer::serve_peer(uint64_t id, int fd) {
         }
     }
 
-    if (cbs_.on_close) cbs_.on_close(*peer);
-    peer->close_internal();
-    std::lock_guard<std::mutex> lk(peers_mtx_);
-    peers_.erase(id);
-    std::lock_guard<std::mutex> lk2(peer_ids_mtx_);
-    peer_ids_.erase(id);
+    if (cbs_.on_close && peer->open()) cbs_.on_close(*peer);
+    cleanup();
 }
 
 void WsServer::broadcast_text(const std::string& payload) {
-    std::vector<WsPeer*> snapshot;
+    // Take shared_ptr snapshots so a peer disappearing mid-broadcast (its
+    // serve_peer thread tearing it down on disconnect) doesn't leave us
+    // holding a dangling WsPeer*.
+    std::vector<WsPeerPtr> snapshot;
     {
         std::lock_guard<std::mutex> lk(peers_mtx_);
         snapshot.reserve(peers_.size());
-        for (auto& [id, peer] : peers_) snapshot.push_back(peer.get());
+        for (auto& [id, peer] : peers_) snapshot.push_back(peer);
     }
-    for (WsPeer* p : snapshot) p->send_text(payload);
+    for (const WsPeerPtr& p : snapshot) p->send_text(payload);
 }
 
 void WsServer::on_publisher_event(const Event& e) {
