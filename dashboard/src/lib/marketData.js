@@ -28,16 +28,22 @@ const MAX_LOG = 4096;
 // ---------------------------------------------------------------------------
 // WebSocket source
 // ---------------------------------------------------------------------------
-function createWsSource(url, events, status) {
+function createWsSource(url, events, status, socket) {
   function connect() {
     status.set('connecting');
     let ws;
     try { ws = new WebSocket(url); }
     catch { status.set('error'); return; }
 
-    ws.addEventListener('open', () => status.set('open'));
+    ws.addEventListener('open', () => {
+      status.set('open');
+      socket.set(ws);
+    });
     ws.addEventListener('error', () => status.set('error'));
-    ws.addEventListener('close', () => status.set('disconnected'));
+    ws.addEventListener('close', () => {
+      status.set('disconnected');
+      socket.set(null);
+    });
 
     ws.addEventListener('message', (ev) => {
       let parsed;
@@ -215,7 +221,7 @@ function createMarketDataStore({ url, mock }) {
       });
       mockCtrl.start();
     } else {
-      const wsSrc = createWsSource(url, events, status);
+      const wsSrc = createWsSource(url, events, status, socket);
       cleanup = wsSrc.connect();
     }
   }

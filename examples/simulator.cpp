@@ -40,6 +40,7 @@
 #include "tt/networking/gateway.hpp"
 #include "tt/networking/protocol.hpp"
 #include "tt/networking/ws_server.hpp"
+#include "tt/networking/ws_gateway.hpp"
 #include "tt/persistence/event_log.hpp"
 
 #include <atomic>
@@ -335,6 +336,7 @@ int main(int argc, char** argv) {
         MarketDataPublisher pub(engine);
         std::unique_ptr<Gateway>   gw;
         std::unique_ptr<WsServer>  ws;
+        std::unique_ptr<WsGateway> ws_gw;
         if (port > 0) {
             gw = std::make_unique<Gateway>(engine, pub, static_cast<std::uint16_t>(port));
             if (!gw->start()) {
@@ -351,6 +353,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::printf("websocket listening on 127.0.0.1:%d\n", ws_port);
+            ws_gw = std::make_unique<WsGateway>(engine, pub, *ws);
+            ws_gw->install();
+            std::printf("websocket accepts client commands (submit/cancel/modify/ping)\n");
         }
 
         // Wait for Ctrl-C.

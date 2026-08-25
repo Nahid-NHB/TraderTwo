@@ -5,6 +5,8 @@
   import { createMarketDataStore } from '$lib/marketData.js';
   import { createCandleAggregator } from '$lib/candleAggregator.js';
   import { createDepthStore } from '$lib/depthAggregator.js';
+  import { createOrderEntry } from '$lib/orderEntry.js';
+  import OrderEntry from '$lib/OrderEntry.svelte';
 
   // ----- Config -----
   let wsPort = 9001;
@@ -85,6 +87,14 @@
 
   md.connect();
   onDestroy(() => md.disconnect());
+
+  // Order entry — re-create whenever the WS reconnects so listeners are
+  // attached to the live socket.
+  let orderEntry = null;
+  md.socket.subscribe(($ws) => {
+    if ($ws) orderEntry = createOrderEntry($ws);
+    else    orderEntry = null;
+  });
 
   // ----- Chart setup -----
   let chartEl;
@@ -308,11 +318,26 @@
     <div class="brand">
       <h1>TraderTwo <span class="tag">{useMock ? 'mock' : 'live'}</span></h1>
       <div class="sub">
-        <select bind:value={selectedInstrument}>
+        <div class="instr-tabs" role="tablist">
           {#each $instruments as i}
-            <option value={i}>Instrument {i}</option>
+            <button
+              class:active={selectedInstrument === i}
+              on:click={() => selectedInstrument = i}
+              role="tab"
+            >
+              <span class="iname">Inst {i}</span>
+              {#if $topOfBook[i]}
+                <span class="itob">
+                  <b class="bid">{$topOfBook[i].bid ? fmtPx($topOfBook[i].bid.price) : '—'}</b>
+                  <span class="sep">·</span>
+                  <b class="ask">{$topOfBook[i].ask ? fmtPx($topOfBook[i].ask.price) : '—'}</b>
+                </span>
+              {:else}
+                <span class="itob muted">— · —</span>
+              {/if}
+            </button>
           {/each}
-        </select>
+        </div>
         <span class="status-text">
           <span class="dot {useMock ? 'open' : md.status}"></span>
           {useMock ? 'mock generator · ~14 ticks/s' : `${wsUrl} · ${md.status}`}
@@ -346,6 +371,45 @@
         <span class="muted">cumulative quantity</span>
       </div>
       <canvas bind:this={depthCanvas}></canvas>
+    </div>
+  </section>
+
+  <section class="watch-row">
+    <div class="card">
+      <div class="card-head">
+        <h2>Watch · all instruments</h2>
+        <span class="muted">{$instruments.length} symbol{$instruments.length === 1 ? '' : 's'} · click to focus</span>
+      </div>
+      <div class="watch-grid">
+        {#each $instruments as i}
+          {@const t = $topOfBook[i]}
+          <button class="watch-cell" class:active={selectedInstrument === i} on:click={() => selectedInstrument = i}>
+            <div class="watch-head">
+              <span class="iname">Inst {i}</span>
+              {#if t}
+                <span class="muted">{t.bid ? `b ${fmt(t.bid.qty)}` : '—'} · {t.ask ? `a ${fmt(t.ask.qty)}` : '—'}</span>
+              {/if}
+            </div>
+            <div class="watch-body">
+              {#if t && t.bid}
+                <div class="bid">B {fmtPx(t.bid.price)}</div>
+              {:else}
+                <div class="muted">B —</div>
+              {/if}
+              {#if t && t.ask}
+                <div class="ask">A {fmtPx(t.ask.price)}</div>
+              {:else}
+                <div class="muted">A —</div>
+              {/if}
+            </div>
+            {#if t && t.bid && t.ask}
+              <div class="watch-spread">spread {fmtPx(t.ask.price - t.bid.price)}</div>
+            {:else}
+              <div class="watch-spread muted">no quote</div>
+            {/if}
+          </button>
+        {/each}
+      </div>
     </div>
   </section>
 
@@ -420,6 +484,26 @@
     </div>
   </section>
 
+  <section class="entry-row">
+    {#if !useMock && orderEntry}
+      <OrderEntry instruments={$instruments} {orderEntry} {selectedInstrument} />
+    {:else if useMock}
+      <div class="card">
+        <div class="card-head"><h2>Order entry</h2></div>
+        <p class="empty">
+          Mock mode is read-only. Connect to the live engine with
+          <a href="?port={wsPort}">?port={wsPort}</a> to submit orders.
+        </p>
+      </div>
+    {:else}
+      <div class="card">
+        <div class="card-head"><h2>Order entry</h2></div>
+        <p class="empty">Waiting for WebSocket connection…</p>
+      </div>
+    {/if}
+  </section>
+
+
   <footer>
     {#if useMock}
       <p>Running with synthetic mock data. Switch to the live engine with
@@ -488,6 +572,7 @@
     margin-top: 6px;
     color: #8a96ac;
     font-size: 13px;
+    flex-wrap: wrap;
   }
   .sub select {
     background: #111827;
@@ -497,6 +582,38 @@
     padding: 4px 8px;
     font-size: 13px;
   }
+
+  /* Instrument tabs in the header — show instrument id + a live BBO. */
+  .instr-tabs {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .instr-tabs button {
+    background: #0f1626;
+    color: #b1bdcf;
+    border: 1px solid #1f2a3d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s;
+  }
+  .instr-tabs button:hover { background: #182237; color: #e7ecf3; }
+  .instr-tabs button.active {
+    background: #1a3a6c;
+    border-color: #2a4a8e;
+    color: #fff;
+  }
+  .instr-tabs .iname { font-weight: 600; letter-spacing: 0.04em; }
+  .instr-tabs .itob  { font-variant-numeric: tabular-nums; }
+  .instr-tabs .itob .sep { color: #4a5670; margin: 0 2px; }
+  .instr-tabs .itob .bid { color: #5cd2a4; }
+  .instr-tabs .itob .ask { color: #f08080; }
+  .instr-tabs .itob.muted { color: #4a5670; }
   .status-text {
     display: flex;
     align-items: center;
@@ -607,6 +724,65 @@
   @media (max-width: 900px) {
     .bottom-row { grid-template-columns: 1fr; }
   }
+
+  .entry-row {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: minmax(280px, 1fr);
+    gap: 16px;
+  }
+  @media (min-width: 1100px) {
+    .entry-row { grid-template-columns: minmax(320px, 1fr) 3fr; }
+  }
+
+  /* Watch grid — one cell per instrument showing its BBO + spread. */
+  .watch-row { margin-top: 16px; }
+  .watch-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+  }
+  .watch-cell {
+    background: #0a111e;
+    border: 1px solid #1f2a3d;
+    border-radius: 6px;
+    padding: 10px 12px;
+    text-align: left;
+    cursor: pointer;
+    color: #cdd6e3;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .watch-cell:hover { background: #111827; border-color: #2a3a5c; }
+  .watch-cell.active {
+    border-color: #2a4a8e;
+    background: #11203e;
+  }
+  .watch-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .watch-head .iname { font-weight: 600; font-size: 13px; }
+  .watch-head .muted { font-size: 10px; }
+  .watch-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    font-variant-numeric: tabular-nums;
+    font-size: 16px;
+  }
+  .watch-body .bid { color: #5cd2a4; font-weight: 600; }
+  .watch-body .ask { color: #f08080; font-weight: 600; text-align: right; }
+  .watch-spread {
+    margin-top: 6px;
+    font-size: 10px;
+    color: #8a96ac;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .watch-spread.muted { color: #4a5670; }
 
   .ladder table {
     width: 100%;

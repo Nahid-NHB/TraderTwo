@@ -10,6 +10,7 @@
 #include "tt/market_data/publisher.hpp"
 #include "tt/matching/matching_engine.hpp"
 #include "tt/networking/ws_server.hpp"
+#include "tt/networking/ws_gateway.hpp"
 
 #include <gtest/gtest.h>
 
@@ -352,6 +353,235 @@ TEST(WsServer, MultipleClientsAllReceive) {
 
     a.close();
     b.close();
+    f.ws.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Typed command-callback tests + end-to-end WsGateway tests.
+// ---------------------------------------------------------------------------
+TEST(WsServer, CommandPingReply) {
+    WsFixture f(/*port=*/19710);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19710));
+    ASSERT_TRUE(c.send_text(R"({"type":"ping","req":42})"));
+
+    std::string frame;
+    bool got_pong = false;
+    for (int i = 0; i < 20 && !got_pong; ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"pong\"") != std::string::npos &&
+                frame.find("\"req\":\"42\"") != std::string::npos) {
+                got_pong = true;
+            }
+        }
+    }
+    EXPECT_TRUE(got_pong) << "expected pong reply";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, CommandSubmitAccepted) {
+    WsFixture f(/*port=*/19711);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19711));
+    ASSERT_TRUE(c.send_text(
+        R"({"type":"submit","req":"r1","i":1,"trader":99,"side":0,"px":100,"qty":5,"tif":"GTC"})"));
+
+    std::string frame;
+    bool got_reply = false;
+    for (int i = 0; i < 20 && !got_reply; ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"submit_result\"") != std::string::npos) {
+                EXPECT_NE(frame.find("\"req\":\"r1\""), std::string::npos);
+                EXPECT_NE(frame.find("\"status\":\"ACCEPTED\""), std::string::npos);
+                got_reply = true;
+            }
+        }
+    }
+    EXPECT_TRUE(got_reply) << "expected submit_result";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, CommandSubmitTriggersTradeBroadcast) {
+    WsFixture f(/*port=*/19712);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19712));
+
+    // Submit a resting sell via the engine (so we have liquidity).
+    f.engine.submit_limit(InstrumentId{1}, TraderId{1}, Side::Sell,
+                          Price{100}, Quantity{5}, TimeInForce::GTC, f.sink);
+
+    // Send an aggressive buy via WS — should match and broadcast a trade.
+    ASSERT_TRUE(c.send_text(
+        R"({"type":"submit","req":"r2","i":1,"trader":2,"side":0,"px":100,"qty":3,"tif":"GTC"})"));
+
+    std::string frame;
+    bool got_trade = false;
+    bool got_result = false;
+    for (int i = 0; i < 30 && !(got_trade && got_result); ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"trade\"") != std::string::npos) got_trade = true;
+            if (frame.find("\"type\":\"submit_result\"") != std::string::npos) got_result = true;
+        }
+    }
+    EXPECT_TRUE(got_trade)  << "expected trade broadcast";
+    EXPECT_TRUE(got_result) << "expected submit_result reply";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, CommandSubmitRejected) {
+    WsFixture f(/*port=*/19713);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19713));
+
+    // Send a sell with px > qty or quantity=0 (engine validates).
+    ASSERT_TRUE(c.send_text(
+        R"({"type":"submit","req":"r3","i":99,"trader":1,"side":1,"px":100,"qty":5,"tif":"GTC"})"));
+
+    std::string frame;
+    bool got = false;
+    for (int i = 0; i < 20 && !got; ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"submit_result\"") != std::string::npos) {
+                EXPECT_NE(frame.find("\"status\":\"REJECTED\""), std::string::npos);
+                got = true;
+            }
+        }
+    }
+    EXPECT_TRUE(got) << "expected rejected reply";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, CommandCancelRoundTrip) {
+    WsFixture f(/*port=*/19714);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19714));
+
+    // First submit (synchronously via engine) so we know an order id.
+    f.engine.submit_limit(InstrumentId{1}, TraderId{1}, Side::Sell,
+                          Price{100}, Quantity{5}, TimeInForce::GTC, f.sink);
+    // We don't know the order_id directly here without inspecting
+    // collecting.results. Use the collecting sink instead and find the id.
+    ASSERT_FALSE(f.collecting.results.empty());
+    std::uint64_t oid = f.collecting.results.front().order_id;
+    EXPECT_NE(oid, kInvalidOrderId);
+
+    ASSERT_TRUE(c.send_text(
+        std::string(R"({"type":"cancel","req":"r4","i":1,"id":)") +
+        std::to_string(oid) + R"("})"));
+
+    std::string frame;
+    bool got = false;
+    for (int i = 0; i < 20 && !got; ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"cancel_result\"") != std::string::npos) {
+                EXPECT_NE(frame.find("\"ok\":true"), std::string::npos);
+                got = true;
+            }
+        }
+    }
+    EXPECT_TRUE(got) << "expected cancel_result ok=true";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, CommandModifyRoundTrip) {
+    WsFixture f(/*port=*/19715);
+    WsGateway gw(f.engine, f.pub, f.ws);
+    gw.install();
+    ASSERT_TRUE(f.start());
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19715));
+
+    f.engine.submit_limit(InstrumentId{1}, TraderId{1}, Side::Sell,
+                          Price{100}, Quantity{5}, TimeInForce::GTC, f.sink);
+    ASSERT_FALSE(f.collecting.results.empty());
+    std::uint64_t oid = f.collecting.results.front().order_id;
+
+    ASSERT_TRUE(c.send_text(
+        std::string(R"({"type":"modify","req":"r5","i":1,"id":)") +
+        std::to_string(oid) + R"(,"qty":3,"px":101})"));
+
+    std::string frame;
+    bool got = false;
+    for (int i = 0; i < 20 && !got; ++i) {
+        if (c.recv_text(frame, 200)) {
+            if (frame.find("\"type\":\"modify_result\"") != std::string::npos) {
+                // Price change triggers a REPLACED (priority reset).
+                EXPECT_NE(frame.find("\"status\":\"REPLACED\""), std::string::npos);
+                got = true;
+            }
+        }
+    }
+    EXPECT_TRUE(got) << "expected modify_result REPLACED";
+
+    c.close();
+    f.ws.stop();
+}
+
+TEST(WsServer, NonCommandFrameFallsThroughToOnText) {
+    WsFixture f(/*port=*/19716);
+    ASSERT_TRUE(f.start());
+
+    std::mutex mtx;
+    std::vector<std::string> received;
+    f.ws.set_callbacks({
+        .on_text = [&](WsPeer&, const std::string& t) {
+            std::lock_guard<std::mutex> lk(mtx);
+            received.push_back(t);
+        },
+        .on_binary = nullptr,
+        .on_close  = nullptr,
+    });
+
+    WsTestClient c;
+    ASSERT_TRUE(c.connect("127.0.0.1", 19716));
+    // No "type" field → not a typed command, should fall through to on_text.
+    ASSERT_TRUE(c.send_text(R"({"foo":"bar"})"));
+
+    // Wait for the server thread to dispatch the callback.
+    for (int i = 0; i < 30; ++i) {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (!received.empty()) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        ASSERT_FALSE(received.empty());
+        EXPECT_EQ(received.front(), R"({"foo":"bar"})");
+    }
+    c.close();
     f.ws.stop();
 }
 

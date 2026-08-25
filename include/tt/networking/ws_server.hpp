@@ -63,9 +63,38 @@ using WsPeerPtr = std::shared_ptr<WsPeer>;
 
 // Per-peer callback bundle. Wired up by the application.
 struct WsPeerCallbacks {
+    // Generic incoming frame. Use this if you want to handle all messages
+    // yourself (you'll need to parse the JSON).
     std::function<void(WsPeer&, const std::string& text)> on_text;
     std::function<void(WsPeer&, const std::string& bin)>  on_binary;
     std::function<void(WsPeer&)>                          on_close;
+};
+
+// Convenience: typed callbacks for the four command types we recognise out
+// of the box. The WsServer parses the JSON frame and dispatches to the
+// matching callback, so the application doesn't need its own JSON parser.
+//
+// Each callback is invoked on the WS server's per-peer thread; it may block
+// (e.g. to drive the matching engine synchronously). The peer pointer
+// passed in is the originator — reply via peer.send_text().
+//
+// Field reference:
+//   submit:  req, i (instrument), trader, side (0=buy, 1=sell),
+//            px (price), qty, tif ("GTC"|"IOC"|"FOK"), [type="LIMIT"]
+//   cancel:  req, i, id (order_id)
+//   modify:  req, i, id, qty, px
+//   ping:    req
+struct WsCommandCallbacks {
+    std::function<void(WsPeer&, const std::string& /*req_id*/,
+                       std::uint64_t /*instrument*/, std::uint64_t /*trader*/,
+                       int /*side*/, std::int64_t /*px*/, std::int64_t /*qty*/,
+                       const std::string& /*tif*/)> on_submit;
+    std::function<void(WsPeer&, const std::string& /*req_id*/,
+                       std::uint64_t /*instrument*/, std::uint64_t /*order_id*/)> on_cancel;
+    std::function<void(WsPeer&, const std::string& /*req_id*/,
+                       std::uint64_t /*instrument*/, std::uint64_t /*order_id*/,
+                       std::int64_t /*qty*/, std::int64_t /*px*/)> on_modify;
+    std::function<void(WsPeer&, const std::string& /*req_id*/)> on_ping;
 };
 
 // Multi-client WebSocket server. Lives alongside the TCP gateway; the
@@ -90,6 +119,11 @@ public:
     // publisher thread (see PublisherListenerAdapter below).
     void set_callbacks(WsPeerCallbacks cbs) { cbs_ = std::move(cbs); }
 
+    // Set typed command callbacks (submit/cancel/modify/ping). When set,
+    // the WS server parses incoming JSON text frames and dispatches each
+    // to the matching callback. Either or both can be set.
+    void set_command_callbacks(WsCommandCallbacks cbs) { cmd_cbs_ = std::move(cbs); }
+
     // Broadcast a text frame to every connected peer. Lock-free during the
     // broadcast loop via the peer_set_ mutex.
     void broadcast_text(const std::string& payload);
@@ -99,6 +133,10 @@ private:
     void serve_peer(uint64_t id, int fd, WsPeerPtr peer);
     void on_publisher_event(const Event& e);
     void on_publisher_tob(InstrumentId id);
+    // Parses a JSON text frame and dispatches to the typed command
+    // callbacks (submit/cancel/modify/ping) if one matches. Returns true
+    // if a callback handled the frame.
+    bool dispatch_command_frame(WsPeer& peer, const std::string& payload);
 
     MarketDataPublisher& pub_;
     std::uint16_t       port_;
@@ -109,7 +147,8 @@ private:
     std::mutex                    peer_ids_mtx_;
     std::unordered_map<uint64_t, WsPeerPtr> peers_;
     std::mutex                    peers_mtx_;
-    WsPeerCallbacks cbs_;
+    WsPeerCallbacks      cbs_;
+    WsCommandCallbacks   cmd_cbs_;
 
     // Publisher listener adapter — translates MarketDataListener callbacks
     // into WS broadcasts. We store the listener object directly and register

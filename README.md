@@ -1,6 +1,6 @@
 # TraderTwo
 
-A deterministic, single-threaded-per-instrument **C++20 matching engine** for limit-order books, built end-to-end across 14 phases: price-time priority order book, multi-instrument matching, cancel/modify, market-data publisher, append-only event log with replay-based crash recovery, pre-trade risk checks, per-instrument worker pool, line-oriented TCP gateway, market simulator, Google-Benchmark scenarios, Prometheus/JSON observability, an RFC 6455 WebSocket market-data endpoint, and a SvelteKit dashboard SPA.
+A deterministic, single-threaded-per-instrument **C++20 matching engine** for limit-order books, built end-to-end across 15 phases: price-time priority order book, multi-instrument matching, cancel/modify, market-data publisher, append-only event log with replay-based crash recovery, pre-trade risk checks, per-instrument worker pool, line-oriented TCP gateway, market simulator, Google-Benchmark scenarios, Prometheus/JSON observability, an RFC 6455 WebSocket market-data endpoint with typed command protocol, a SvelteKit dashboard SPA, and a multi-instrument tabbed layout with order-entry panel.
 
 > Educational reference implementation. Not production-grade — the matcher is single-threaded, the gateway is BSD-socket based, and the persistence layer has no CRC.
 
@@ -10,7 +10,7 @@ A deterministic, single-threaded-per-instrument **C++20 matching engine** for li
 
 | Metric | Value |
 |---|---|
-| Unit tests | **125** across 20 suites, all passing |
+| Unit tests | **132** across 20 suites, all passing |
 | Sustained throughput | ~5M submit+cancel/s · ~5M orders/s simulator · ~1.8M same-level inserts/s |
 | Stress test | 200K mixed orders across 8 instruments in ~0.6 s |
 | Standards | C++20, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion` |
@@ -27,7 +27,7 @@ cmake --build build -j
 
 # Run all tests
 ctest --test-dir build --output-on-failure
-# 100% tests passed out of 125
+# 100% tests passed out of 132
 
 # Run the smoke demo
 ./build/tt_demo
@@ -102,7 +102,8 @@ Six scenarios covering insertion, full matching, single-level queue growth, modi
 ### Run the live dashboard
 
 ```sh
-# Terminal 1 — start the engine with both TCP and WS endpoints
+# Terminal 1 — start the engine with both TCP and WS endpoints.
+# The WS endpoint also accepts client commands (submit/cancel/modify/ping).
 ./build/tt_simulator --random 50000 --instruments 4 \
                      --port 9000 --ws-port 9001
 
@@ -113,14 +114,40 @@ npm run dev
 # open http://127.0.0.1:5173/?port=9001
 ```
 
-The C++ side exposes a minimal RFC 6455 WebSocket server (`src/networking/ws_server.cpp`) that broadcasts JSON frames for every trade and top-of-book update. The dashboard (under `dashboard/`) is a SvelteKit SPA styled like TradingView: candlestick chart (powered by TradingView Lightweight Charts™), depth visualisation, order-book ladder, and time-and-sales tape.
+The C++ side exposes a minimal RFC 6455 WebSocket server (`src/networking/ws_server.cpp`) that broadcasts JSON frames for every trade and top-of-book update. The dashboard (under `dashboard/`) is a SvelteKit SPA styled like TradingView: candlestick chart (powered by TradingView Lightweight Charts™), depth visualisation, order-book ladder, time-and-sales tape, **multi-instrument tabbed layout with a watch grid showing every instrument's BBO side-by-side**, and an **order-entry panel** that sends typed commands back to the engine over the same WebSocket connection.
 
-Message format:
+Server-to-client broadcast frames:
 
 ```
 {"type":"trade","i":1,"buy":2,"sell":1,"px":100,"qty":3,"seq":2}
 {"type":"tob","i":1,"b":9600,"bq":24,"a":9900,"aq":2,"hb":1,"ha":1}
 ```
+
+Client-to-server commands (sent as JSON text frames; `req` is an opaque
+echo tag round-tripped in the reply):
+
+```
+{"type":"ping","req":"abc"}
+{"type":"submit","req":"r1","i":1,"trader":99,"side":0,"px":100,"qty":5,"tif":"GTC"}
+{"type":"cancel","req":"r2","i":1,"id":7}
+{"type":"modify","req":"r3","i":1,"id":7,"qty":3,"px":101}
+```
+
+Replies:
+
+```
+{"type":"pong","req":"abc"}
+{"type":"submit_result","req":"r1","status":"ACCEPTED","id":7,"i":1,"seq":42,"filled":0,"resting":5}
+{"type":"submit_result","req":"r1","status":"REJECTED","reason":"unknown instrument"}
+{"type":"cancel_result","req":"r2","ok":true,"i":1,"id":7}
+{"type":"modify_result","req":"r3","status":"REPLACED","i":1,"id":7}
+```
+
+`WsGateway` (`src/networking/ws_gateway.cpp`) handles these commands and
+forwards the matching-engine trade events back through the
+`MarketDataPublisher`, so any WS client that aggresses against resting
+liquidity will broadcast resulting trades to **all** connected clients,
+not just the originating peer.
 
 ---
 
@@ -136,15 +163,17 @@ include/tt/
   persistence/   append-only event log + replayer
   risk/          pre-trade risk gate (max qty, max notional, price collar, rate limit)
   concurrency/   SPSC queue + per-instrument worker pool
-  networking/    line-oriented protocol + BSD-socket gateway
+  networking/    line-oriented TCP protocol, BSD-socket gateway,
+                 RFC 6455 WebSocket server, WsGateway command bridge
   observability/ metrics (Prometheus + JSON) + structured JSON logger
 
 src/              implementations of the above
 examples/         demo_phase1.cpp, simulator.cpp
 benchmarks/       bench_phase1.cpp (Google-Benchmark)
-dashboard/        SvelteKit SPA for live market-data visualisation
-tests/            125 unit + stress tests
-notes.md          14-phase build plan
+dashboard/        SvelteKit SPA for live market-data visualisation,
+                  multi-instrument tabs, order-entry panel
+tests/            132 unit + stress + integration tests
+notes.md          15-phase build plan
 ```
 
 ---

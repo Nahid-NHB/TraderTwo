@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
 #include <openssl/sha.h>
@@ -117,6 +118,83 @@ bool parse_request_line(const std::string& req,
     method  = line.substr(0, p1);
     path    = line.substr(p1 + 1, p2 - p1 - 1);
     version = line.substr(p2 + 1);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Tiny JSON helpers for our flat command format. We only need:
+//   - find a string field by name:  {"type":"submit","req":"1",...}
+//   - find an integer field by name: {"px":100}
+//   - find a nested string field
+// We don't need a general parser — these are sufficient and zero-alloc.
+// ---------------------------------------------------------------------------
+
+// Find the value range for `name` in a flat JSON object. Returns true and
+// sets [vstart, vend) to point at the value substring; or false if missing.
+// Handles "name":value or "name": "value" with surrounding whitespace.
+bool json_find_value(const std::string& s, const char* name,
+                     std::size_t& vstart, std::size_t& vend) {
+    std::string needle = "\"";
+    needle += name;
+    needle += "\"";
+    auto pos = s.find(needle);
+    if (pos == std::string::npos) return false;
+    pos += needle.size();
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
+    if (pos >= s.size() || s[pos] != ':') return false;
+    ++pos;
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t')) ++pos;
+    vstart = pos;
+    if (pos < s.size() && s[pos] == '"') {
+        ++vstart;
+        ++pos;
+        // Skip until matching closing quote (no escapes for our payloads).
+        auto end = s.find('"', pos);
+        if (end == std::string::npos) return false;
+        vend = end;
+    } else {
+        // Numeric or boolean. Walk until comma, brace, or whitespace.
+        vend = pos;
+        while (vend < s.size() &&
+               s[vend] != ',' && s[vend] != '}' &&
+               s[vend] != ' '  && s[vend] != '\t') ++vend;
+    }
+    return true;
+}
+
+bool json_get_string(const std::string& s, const char* name, std::string& out) {
+    std::size_t a, b;
+    if (!json_find_value(s, name, a, b)) return false;
+    out.assign(s, a, b - a);
+    return true;
+}
+
+bool json_get_int(const std::string& s, const char* name, std::int64_t& out) {
+    std::size_t a, b;
+    if (!json_find_value(s, name, a, b)) return false;
+    std::string tmp(s, a, b - a);
+    if (tmp.empty()) return false;
+    char* endp = nullptr;
+    long long v = std::strtoll(tmp.c_str(), &endp, 10);
+    if (endp == tmp.c_str()) return false;
+    out = static_cast<std::int64_t>(v);
+    return true;
+}
+
+bool json_get_uint(const std::string& s, const char* name, std::uint64_t& out) {
+    std::int64_t v;
+    if (!json_get_int(s, name, v)) return false;
+    if (v < 0) return false;
+    out = static_cast<std::uint64_t>(v);
+    return true;
+}
+
+// Parse a `"req"` field which may be either a number or a string.
+// Always returns the field as a string (preserving the original form).
+bool json_get_req(const std::string& s, std::string& out) {
+    std::size_t a, b;
+    if (!json_find_value(s, "req", a, b)) return false;
+    out.assign(s, a, b - a);
     return true;
 }
 
@@ -388,8 +466,15 @@ void WsServer::serve_peer(uint64_t id, int fd, WsPeerPtr peer) {
             } else if (opc == 0xA) {  // pong → ignore
                 continue;
             } else if (opc == 0x1 || opc == 0x2) {  // text/binary
-                if (opc == 0x1 && cbs_.on_text) cbs_.on_text(*peer, payload);
-                else if (opc == 0x2 && cbs_.on_binary) cbs_.on_binary(*peer, payload);
+                if (opc == 0x1) {
+                    // Typed command callbacks first (submit/cancel/modify/ping).
+                    // If none of them handled the frame, fall through to on_text.
+                    if (!dispatch_command_frame(*peer, payload)) {
+                        if (cbs_.on_text) cbs_.on_text(*peer, payload);
+                    }
+                } else if (opc == 0x2 && cbs_.on_binary) {
+                    cbs_.on_binary(*peer, payload);
+                }
             }
             (void)fin;  // we don't support fragmentation
         }
@@ -441,6 +526,61 @@ void WsServer::on_publisher_tob(InstrumentId id) {
         tob.has_bid ? 1 : 0,
         tob.has_ask ? 1 : 0);
     broadcast_text(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Command dispatch — parse a JSON text frame and route to the typed
+// callbacks if one matches. Returns true if a command callback handled the
+// frame (in which case on_text is NOT called), false otherwise.
+// ---------------------------------------------------------------------------
+bool WsServer::dispatch_command_frame(WsPeer& peer, const std::string& payload) {
+    std::string type;
+    if (!json_get_string(payload, "type", type)) return false;
+    std::string req;
+    json_get_req(payload, req);  // optional
+
+    if (type == "ping") {
+        if (!cmd_cbs_.on_ping) return false;
+        cmd_cbs_.on_ping(peer, req);
+        return true;
+    }
+    if (type == "submit") {
+        if (!cmd_cbs_.on_submit) return false;
+        std::uint64_t inst=0, side_u=0;
+        std::int64_t  px=0, qty=0;
+        std::string   tif;
+        json_get_uint(payload, "i", inst);
+        std::uint64_t trader=0;
+        json_get_uint(payload, "trader", trader);
+        json_get_uint(payload, "side", side_u);
+        json_get_int (payload, "px", px);
+        json_get_int (payload, "qty", qty);
+        json_get_string(payload, "tif", tif);
+        if (tif.empty()) tif = "GTC";
+        cmd_cbs_.on_submit(peer, req, inst, trader,
+                          static_cast<int>(side_u), px, qty, tif);
+        return true;
+    }
+    if (type == "cancel") {
+        if (!cmd_cbs_.on_cancel) return false;
+        std::uint64_t inst=0, oid=0;
+        json_get_uint(payload, "i", inst);
+        json_get_uint(payload, "id", oid);
+        cmd_cbs_.on_cancel(peer, req, inst, oid);
+        return true;
+    }
+    if (type == "modify") {
+        if (!cmd_cbs_.on_modify) return false;
+        std::uint64_t inst=0, oid=0;
+        std::int64_t  px=0, qty=0;
+        json_get_uint(payload, "i", inst);
+        json_get_uint(payload, "id", oid);
+        json_get_int (payload, "px", px);
+        json_get_int (payload, "qty", qty);
+        cmd_cbs_.on_modify(peer, req, inst, oid, qty, px);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace tt

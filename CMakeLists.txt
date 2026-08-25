@@ -28,6 +28,7 @@ add_library(tt_core
     src/networking/protocol.cpp
     src/networking/gateway.cpp
     src/networking/ws_server.cpp
+    src/networking/ws_gateway.cpp
     src/observability/metrics.cpp
     src/observability/structured_log.cpp
 )
