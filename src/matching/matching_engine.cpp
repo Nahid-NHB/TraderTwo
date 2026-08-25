@@ -25,10 +25,61 @@ void MatchingEngine::register_instrument(InstrumentId id) {
     if (books_.find(id) == books_.end()) {
         books_.emplace(id, std::make_unique<OrderBook>(id));
     }
+    if (descriptors_.find(id) == descriptors_.end()) {
+        InstrumentDescriptor d{};
+        d.id        = id;
+        d.symbol    = std::to_string(id);
+        d.tick_size = Price{1};
+        d.lot_size  = Quantity{1};
+        d.enabled   = true;
+        descriptors_.emplace(id, d);
+    }
+}
+
+void MatchingEngine::register_instrument(const InstrumentDescriptor& desc) {
+    register_instrument(desc.id);
+    descriptors_[desc.id] = desc;
+}
+
+bool MatchingEngine::unregister_instrument(InstrumentId id) {
+    auto it = books_.find(id);
+    if (it == books_.end()) return false;
+    books_.erase(it);
+    descriptors_.erase(id);
+    return true;
+}
+
+const InstrumentDescriptor* MatchingEngine::descriptor(InstrumentId id) const noexcept {
+    auto it = descriptors_.find(id);
+    return it == descriptors_.end() ? nullptr : &it->second;
+}
+
+std::vector<InstrumentId> MatchingEngine::instrument_ids() const {
+    std::vector<InstrumentId> out;
+    out.reserve(descriptors_.size());
+    for (const auto& [id, _] : descriptors_) out.push_back(id);
+    return out;
+}
+
+std::string MatchingEngine::validate_order(InstrumentId id, Price price,
+                                           Quantity qty) const noexcept {
+    if (!qty.is_valid()) return "invalid quantity";
+    const auto* desc = descriptor(id);
+    if (!desc) return "instrument not registered";
+    if (!desc->enabled) return "instrument disabled";
+    if (price.ticks > 0) {
+        if (!is_valid_tick(desc->tick_size)) return "invalid tick size";
+        if (!price.is_valid()) return "invalid price";
+        if ((price.ticks % desc->tick_size.ticks) != 0) return "price not on tick";
+    }
+    if (!is_valid_lot(desc->lot_size)) return "invalid lot size";
+    if ((qty.qty % desc->lot_size.qty) != 0) return "qty not on lot";
+    return {};
 }
 
 void MatchingEngine::clear() {
     books_.clear();
+    descriptors_.clear();
     next_sequence_ = 1;
 }
 
@@ -40,6 +91,10 @@ OrderBook* MatchingEngine::book(InstrumentId id) noexcept {
 const OrderBook* MatchingEngine::book(InstrumentId id) const noexcept {
     auto it = books_.find(id);
     return it == books_.end() ? nullptr : it->second.get();
+}
+
+void MatchingEngine::set_risk_gate(std::shared_ptr<RiskGate> gate) noexcept {
+    risk_gate_ = std::move(gate);
 }
 
 void MatchingEngine::submit_limit(InstrumentId instrument, TraderId trader, Side side,
@@ -74,24 +129,24 @@ void MatchingEngine::submit(std::unique_ptr<Order> order, TradeSink& sink) {
         // (gateway); here we do it at the engine so single-thread tests work.
         order->id = next_sequence_;
     }
+    result.order_id      = order->id;
+    result.instrument_id = order->instrument_id;
+
     if (order->instrument_id == kInvalidInstrumentId) {
         result.status = SubmitStatus::Rejected;
         result.reject_reason = "invalid instrument";
-        result.order_id = order->id;
         sink.on_submit_result(result);
         return;
     }
     if (!order->quantity.is_valid() || order->remaining.qty <= 0) {
         result.status = SubmitStatus::Rejected;
         result.reject_reason = "invalid quantity";
-        result.order_id = order->id;
         sink.on_submit_result(result);
         return;
     }
     if (order->is_limit() && !order->price.is_valid()) {
         result.status = SubmitStatus::Rejected;
         result.reject_reason = "invalid price";
-        result.order_id = order->id;
         sink.on_submit_result(result);
         return;
     }
@@ -100,15 +155,27 @@ void MatchingEngine::submit(std::unique_ptr<Order> order, TradeSink& sink) {
     if (!ob) {
         result.status = SubmitStatus::Rejected;
         result.reject_reason = "instrument not registered";
-        result.order_id = order->id;
         sink.on_submit_result(result);
         return;
     }
 
+    // ---- Risk gate -----------------------------------------------------------
+    if (risk_gate_) {
+        RiskDecision d = risk_gate_->evaluate(*order);
+        if (!d.ok()) {
+            result.status = SubmitStatus::Rejected;
+            result.reject_reason = "risk: " + d.reason;
+            sink.on_submit_result(result);
+            return;
+        }
+    }
+
     // ---- Sequence assignment ------------------------------------------------
     order->sequence = next_sequence_++;
-    result.order_id = order->id;
     result.sequence = order->sequence;
+    result.side     = order->side;
+    result.type     = order->type;
+    result.price    = order->price;
 
     // We release the order from the unique_ptr only when it has been fully
     // consumed or needs to rest. Until then we work with a raw pointer.
@@ -177,22 +244,22 @@ void MatchingEngine::submit(std::unique_ptr<Order> order, TradeSink& sink) {
 
 bool MatchingEngine::match_against(Order& taker, TradeSink& sink) {
     OrderBook* ob = book(taker.instrument_id);
-    if (!ob) return taker.remaining.qty > 0;
+    if (!ob) [[unlikely]] return taker.remaining.qty > 0;
 
-    while (taker.remaining.qty > 0) {
+    while (taker.remaining.qty > 0) [[likely]] {
         Price best_opposite = ob->best_opposite_price(taker.side);
-        if (!best_opposite.is_valid()) break;
+        if (!best_opposite.is_valid()) [[unlikely]] break;
 
         // Limit price guard.
-        if (taker.is_limit()) {
-            if (!crosses(taker.side, taker.price, best_opposite)) break;
+        if (taker.is_limit()) [[likely]] {
+            if (!crosses(taker.side, taker.price, best_opposite)) [[unlikely]] break;
         }
 
         // Fill against the front of the opposite book. We must grab the
         // resting order's id before the call because reduce_front may
         // unlink it.
         Order* resting = ob->best_opposite_order(taker.side);
-        if (!resting) break;
+        if (!resting) [[unlikely]] break;
 
         OrderId resting_id = resting->id;
         Price   exec_price = best_opposite;  // passive price wins
@@ -200,7 +267,7 @@ bool MatchingEngine::match_against(Order& taker, TradeSink& sink) {
         // Cap qty at min(taker.remaining, resting.remaining). The book's
         // fill caps at resting.remaining for safety.
         Quantity qty_to_fill{taker.remaining};
-        if (qty_to_fill.qty > resting->remaining.qty) {
+        if (qty_to_fill.qty > resting->remaining.qty) [[likely]] {
             qty_to_fill = resting->remaining;
         }
 
@@ -216,7 +283,7 @@ bool MatchingEngine::match_against(Order& taker, TradeSink& sink) {
         t.quantity      = qty_to_fill;
         t.sequence      = taker.sequence;
         t.timestamp     = now_ns();
-        if (taker.is_buy()) {
+        if (taker.is_buy()) [[likely]] {
             t.buy_order_id  = taker.id;
             t.buy_trader_id = taker.trader_id;
             t.sell_order_id = resting_id;
@@ -244,6 +311,22 @@ bool MatchingEngine::cancel(InstrumentId instrument, OrderId id) {
     OrderBook* ob = book(instrument);
     if (!ob) return false;
     return ob->cancel(id);
+}
+
+OrderBook::ModifyResult MatchingEngine::modify(InstrumentId instrument,
+                                               OrderId id,
+                                               Quantity new_qty,
+                                               Price new_price) {
+    OrderBook* ob = book(instrument);
+    if (!ob) return OrderBook::ModifyResult::NotFound;
+    return ob->modify(id, new_qty, new_price);
+}
+
+bool MatchingEngine::reduce(InstrumentId instrument, OrderId id,
+                            Quantity new_qty) {
+    OrderBook* ob = book(instrument);
+    if (!ob) return false;
+    return ob->reduce(id, new_qty);
 }
 
 }  // namespace tt

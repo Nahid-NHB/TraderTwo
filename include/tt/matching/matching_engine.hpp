@@ -30,9 +30,11 @@
 
 #pragma once
 
+#include "tt/common/instrument.hpp"
 #include "tt/common/types.hpp"
 #include "tt/core/order.hpp"
 #include "tt/orderbook/order_book.hpp"
+#include "tt/risk/risk.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -52,13 +54,20 @@ enum class SubmitStatus : uint8_t {
     Cancelled       = 4,  // user-initiated cancel (Phase 3)
 };
 
+// NOTE: instrument is exposed on SubmitResult so the MarketDataPublisher
+// can refresh top-of-book for the right instrument.
+
 // Event emitted to a TradeSink.
 struct SubmitResult {
     SubmitStatus      status{SubmitStatus::Accepted};
     OrderId           order_id{kInvalidOrderId};
+    InstrumentId      instrument_id{kInvalidInstrumentId};
     Sequence          sequence{0};
     Quantity          filled_quantity{Quantity{0}};   // sum of fills
     Quantity          resting_quantity{Quantity{0}};  // what's left in the book
+    Side              side{Side::Buy};
+    OrderType         type{OrderType::Limit};
+    Price             price{Price{0}};
     std::string       reject_reason;                  // empty on success
 };
 
@@ -99,6 +108,23 @@ public:
     // Register an instrument. Idempotent. The caller chooses InstrumentIds.
     void register_instrument(InstrumentId id);
 
+    // Register an instrument with metadata. Idempotent for the same id.
+    void register_instrument(const InstrumentDescriptor& desc);
+
+    // Remove a registered instrument and drop its book. Returns true if the
+    // instrument existed. Use with care: any in-flight orders for the
+    // instrument will be lost.
+    bool unregister_instrument(InstrumentId id);
+
+    // Lookup helpers.
+    const InstrumentDescriptor* descriptor(InstrumentId id) const noexcept;
+    std::vector<InstrumentId> instrument_ids() const;
+
+    // Validate that a (price, qty) pair is acceptable for the given
+    // instrument. Returns empty string on success or a human-readable reason
+    // on failure.
+    std::string validate_order(InstrumentId id, Price price, Quantity qty) const noexcept;
+
     // Drop everything. Test helper.
     void clear();
 
@@ -115,9 +141,22 @@ public:
     // Cancel a resting order. Returns true if cancelled.
     bool cancel(InstrumentId instrument, OrderId id);
 
+    // Modify a resting order. Returns the same ModifyResult as OrderBook.
+    // On a successful reduce-only, the order keeps its priority. On a price
+    // change or quantity increase, the order is replaced (priority reset).
+    OrderBook::ModifyResult modify(InstrumentId instrument, OrderId id,
+                                   Quantity new_qty, Price new_price);
+
+    // Reduce-only modification. Returns false on failure.
+    bool reduce(InstrumentId instrument, OrderId id, Quantity new_qty);
+
     // Read-only access to a book for inspection (tests, market data).
     OrderBook*       book(InstrumentId id)       noexcept;
     const OrderBook* book(InstrumentId id) const noexcept;
+
+    // Risk gate ownership. Engine consults the gate on every submission.
+    void   set_risk_gate(std::shared_ptr<RiskGate> gate) noexcept;
+    std::shared_ptr<RiskGate> risk_gate() const noexcept { return risk_gate_; }
 
     // Sequence / metrics.
     Sequence next_sequence() const noexcept { return next_sequence_; }
@@ -138,6 +177,8 @@ private:
     }
 
     std::unordered_map<InstrumentId, std::unique_ptr<OrderBook>> books_;
+    std::unordered_map<InstrumentId, InstrumentDescriptor>      descriptors_;
+    std::shared_ptr<RiskGate>                                  risk_gate_;
     Sequence next_sequence_{1};
 };
 
